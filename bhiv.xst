@@ -5,7 +5,7 @@ run
 -ofn bhiv
 -ofmt NGC
 -p xc5vlx110t-1-ff1136
--top core
+-top bhiv
 -opt_mode Speed
 -opt_level 2
 -power NO

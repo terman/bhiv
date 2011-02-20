@@ -1,1 +1,7 @@
+verilog work bram.v
+verilog work cache.v
+verilog work core.v
+verilog work fifo.v
+verilog work risc.v
+verilog work mem.v
 verilog work bhiv.v

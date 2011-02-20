@@ -7,10 +7,11 @@ _start:
 	j start
 	nop 
 exception:
+	lw $30,-4($0)
 	j exception
 	nop
 fail:
-	sw $30,-4($0)
+	lw $30,-4($0)
 	j fail
 	nop	
 start:        
@@ -31,9 +32,16 @@ loop2:	lw $t2,($t1)
 	bgt  $t0,0,loop2
 	nop
 
-done:	ld $30,-4($0)
-	addiu $30,$30,1
-	sw $30,-4($0)
+force_miss:
+	la $t1,array
+	lw $t2,($t1)    # ensure word is in cache
+	li $t0,0x1234
+	sw $t0,($t1)    # make it dirty, should be a hit
+	lwu $t2,($t1)   # should force a writeback, refill
+	bne $t2,$t0,fail
+	nop
+
+done:	lw $30,-4($0)
 	j done
 	nop
 

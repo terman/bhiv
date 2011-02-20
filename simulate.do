@@ -1,2 +1,3 @@
-run 10ms
+onbreak {exit}
+run 1ms
 exit

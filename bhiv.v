@@ -1,7 +1,39 @@
+// -*- mode: Verilog; -*-
+
+/*
+Copyright (C) 2011 by Christopher Terman
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+*/
+
 `timescale 1 ns / 100 ps
 
-// a simple multicore system
-module bhiv();
+////////////////////////////////////////////////////////////////////////////////
+//
+//	Multicore system with ring interconnect (simulation top level)
+//
+////////////////////////////////////////////////////////////////////////////////
+
+module bhiv(
+  input clk,
+  input reset
+);
   localparam TSIZE = 4;   // slot type field is [TSIZE-1:0]
   localparam SSIZE = 4;   // slot source field is [SSIZE-1:0]
   localparam NCORES = 3;  // must be less than (1 << SSIZE)
@@ -10,8 +42,6 @@ module bhiv();
   localparam NBWORDS = 3;   // with 2**3 words each
   localparam NBCACHELINE = 30-NBWORDS;  // number of address bits to address a cache line
   localparam NWORDS = (1 << NBWORDS);  // words per cache line
-
-  reg clk,reset;
 
   //**************************************************
   //**
@@ -37,8 +67,17 @@ module bhiv();
       wire [SSIZE-1:0] source;
       wire [31:0] data;
 
+      localparam FIRSTCORE = (i == 1);
+
       // wire up a core!
-      core #(.CORENUM(i),.TSIZE(TSIZE),.SSIZE(SSIZE),.NBLINES(NBLINES),.NBWORDS(NBWORDS))
+      core #(.CORENUM(i),
+             .NCORES(NCORES),
+             .TSIZE(TSIZE),
+             .SSIZE(SSIZE),
+             .NBLINES(NBLINES),
+             .NBWORDS(NBWORDS),
+             .SLOT_METERS(FIRSTCORE),
+             .MEM_METERS(FIRSTCORE))
            coreN(.clk(clk),
                  .reset(reset),
                 .slot_type_in(slot_type[i-1]),
@@ -63,7 +102,7 @@ module bhiv();
     end
   endgenerate
 
-  `include "ring.v"
+  `include "ring.h"
 
   // connect up the ends of the ring
   always @(posedge clk) begin
@@ -98,182 +137,34 @@ module bhiv();
             .empty(addr_empty),
             .full());
 
-  // simple memory for now
-  parameter MBITS = 14;   // 8k words
-  (* ram_style = "block" *)
-  reg [31:0] mem[0:(1 << MBITS)-1];
-  
-  // states 0-(NWORDS-1) count the cycles during which a cache line is read/written
-  // state NWORDS is the idle state
+  // simple counter-baseed state machine
+  //   idle when count == NWORDS
+  //   mem access when 0 <= count < NWORDS
   reg [NBWORDS:0] mcnt;
-
   wire m_idle = reset || (mcnt == NWORDS);
+
+  // decode output of address fifo
   wire [NBCACHELINE-1:0] line = addr_out[NBCACHELINE-1:0];
-  wire out_of_range = (line[NBCACHELINE-1:(MBITS-1)-NBWORDS+1] != 0);
   wire write = addr_out[NBCACHELINE];
   wire [SSIZE-1:0] dest = addr_out[SSIZE+NBCACHELINE+1 - 1:NBCACHELINE+1];
-  wire [MBITS-1:0] m_addr = {line[(MBITS-1)-NBWORDS:0],mcnt[NBWORDS-1:0]};
+
+  // THIS IS WRONG! doesn't account for pipe state on reads
+  wire [31:0] mem_out;
   always @(posedge clk) begin
     if (reset) mcnt <= NWORDS;
-    else if (!addr_empty && m_idle && !out_of_range) mcnt <= 0;
+    else if (!addr_empty && m_idle) mcnt <= 0;
     else if (!m_idle) mcnt <= mcnt + 1;
 
-    if (!m_idle && write) mem[m_addr] <= wdata_data;
-
+    // fill in head of memory controller ring
     mc_dest[0] <= (!m_idle && !write) ? dest : 0;
     mc_count[0] <= mcnt[NBWORDS-1:0];
-    mc_data[0] <= (!m_idle && !write) ? mem[m_addr] : 0;
-
-    // some debuging: look for access to a cache line beyond the top of memory
-    if (!addr_empty && out_of_range)
-      $display("***** address out of range: src=%x, write=%x, line=%x",dest,write,line);
+    mc_data[0] <= (!m_idle && !write) ? mem_out : 0;
   end
   assign wdata_rd = !m_idle && write;  // consume a word of data from the wdata fifo
   assign addr_rd = (mcnt == NWORDS-1);  // move to the next address in the addr fifo
 
-  //**************************************************
-  //**  simulation lash up
-  //**************************************************
+  // main memory, currently just a block ram
+  mem main(.addra({line,mcnt[NBWORDS-1:0]}),.clka(clk),.dina(wdata_data),.douta(mem_out),.wea(!m_idle && write),
+           .addrb(0),.clkb(clk),.dinb(0),.doutb(),.web(0));
 
-  initial begin
-    clk = 1;
-    reset = 1;
-    $readmemh("mem.vmh",mem);
-
-    #35   // 3 cycles of reset
-    reset = 0;
-
-    //#100000   // 10000 cycles
-    //$finish;
-  end
-  always #5 clk = ~clk;
-
-  reg [31:0] cycle;
-  always @(posedge clk) cycle <= reset ? 0 : cycle+1;
-
-  // stop when there's a read from last line
-  always @ (negedge clk)
-    if (!addr_empty && line == ((1<<NBCACHELINE) - 1)) begin
-      $display("terminated at cycle %d!",cycle);
-      $finish;
-    end
-
-  // follow execution in core N
-  localparam N = 1;
-  always @(negedge clk) if (!reset) begin
-    $write("slot=");
-    case (bhiv.coreBlk[N].type)
-      NULL: $write("----");
-      TOKEN: $write("TOKN");
-      ADDR: $write("ADDR");
-      WDATA: $write("WDAT");
-      default: $write("%x",bhiv.coreBlk[N].type);
-    endcase
-    $write(":%x:%x ",bhiv.coreBlk[N].source,bhiv.coreBlk[N].data);
-    $write("mc=%x:%x:%x ",mc_dest[N-1],mc_count[N-1],mc_data[N-1]);
-    $write("pcx1=%x ",bhiv.coreBlk[1].coreN.cpu.dp.pc_x);
-    $write("pcx2=%x ",bhiv.coreBlk[2].coreN.cpu.dp.pc_x);
-    $write("pcx3=%x ",bhiv.coreBlk[3].coreN.cpu.dp.pc_x);
-    //$write("rdy=%x ",bhiv.coreBlk[N].coreN.rdy);
-    //$write("mreq=%x%x ",bhiv.coreBlk[N].coreN.dcache.saved_rd,bhiv.coreBlk[N].coreN.dcache.saved_wr);
-    //$write("maddr=%x ",bhiv.coreBlk[N].coreN.maddr);
-    //$write("iaddr=%x ",bhiv.coreBlk[N].coreN.iaddr);
-    //$write("advance=%x ",bhiv.coreBlk[N].coreN.cpu.ctl.advance);
-    //$write("next_cstate=%x ",bhiv.coreBlk[N].coreN.cpu.ctl.next_state);
-    //$write("cstate=%x ",bhiv.coreBlk[N].coreN.cpu.ctl.state);
-    //$write("dvalid=%x%x ",bhiv.coreBlk[N].coreN.dcache.v0,bhiv.coreBlk[N].coreN.dcache.v1);
-    //$write("dhit=%x%x ",bhiv.coreBlk[N].coreN.dcache.hit0,bhiv.coreBlk[N].coreN.dcache.hit1);
-    //$write("state=%x ",bhiv.coreBlk[N].coreN.dcache.state);
-    //$write("cnt=%x ",bhiv.coreBlk[N].coreN.dcache.wb_count);
-    //$write("rfaddr=%x ",bhiv.coreBlk[N].coreN.dcache.refill_addr);
-    //$write("rfwr=%x%x",bhiv.coreBlk[N].coreN.dcache.refill_write_way0,bhiv.coreBlk[N].coreN.dcache.refill_write_way1);
-    //$write("dmiss=%x ",bhiv.coreBlk[N].coreN.dcache.miss);
-    //$write("dreq=%x ",bhiv.coreBlk[N].coreN.d_ring_req);
-    //$write("dack=%x ",bhiv.coreBlk[N].coreN.d_ring_ack);
-    //$write("rdata=%x ",bhiv.coreBlk[N].coreN.mdin);
-    //$write("pcx=%x ",bhiv.coreBlk[N].coreN.cpu.dp.pc_x);
-    //$write("instx=%x ",bhiv.coreBlk[N].coreN.cpu.ctl.inst_x);
-    //$write("opcode=%x ",bhiv.coreBlk[N].coreN.cpu.ctl.inst_x[31:26]);
-    //$write("rs=%x ",bhiv.coreBlk[N].coreN.cpu.dp.rs);
-    //$write("a=%x ",bhiv.coreBlk[N].coreN.cpu.dp.a);
-    //$write("b=%x ",bhiv.coreBlk[N].coreN.cpu.dp.b);
-    //$write("wdata=%x ",bhiv.coreBlk[N].coreN.cpu.dp.wdata);
-    //$write("op=%x ",bhiv.coreBlk[N].coreN.cpu.dp.md.op);
-    //$write("state=%x ",bhiv.coreBlk[N].coreN.cpu.dp.md.state);
-    //$write("counter=%x ",bhiv.coreBlk[N].coreN.cpu.dp.md.counter);
-    //$write("b=%x ",bhiv.coreBlk[N].coreN.cpu.dp.md.b);
-    //$write("p=%x ",bhiv.coreBlk[N].coreN.cpu.dp.md.p);
-    //$write("lo=%x ",bhiv.coreBlk[N].coreN.cpu.dp.md.lo);
-    //$write("hi=%x ",bhiv.coreBlk[N].coreN.cpu.dp.md.hi);
-    //$write("=%x ",{cbhiv.coreBlk[N].coreN.cpu.dp.md.dividend_sign,bhiv.coreBlk[N].coreN.cpu.dp.md.divisor_sign});
-    $display("");
-  end
 endmodule
-
-////////////////////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////////////////
-//
-//	FIFO
-//
-////////////////////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////////////////
-
-module fifo #(parameter WIDTH = 32, LOGSIZE = 10) (
-  input clk,
-  input reset,
-  input [WIDTH-1:0] din,
-  input rd_en,
-  input wr_en,
-  output [WIDTH-1:0] dout,
-  output empty,
-  output full
-  );
-
-  localparam SIZE = 1 << LOGSIZE;
-
-  reg [LOGSIZE-1:0] ra, wa, count;
-
-  assign full = (count > (SIZE-4));
-  assign empty = (count == 0);
-
-  always @(posedge clk) begin
-    if (reset) count <= 0;
-    else if (rd_en && ~wr_en) count <= count - 1;
-    else if (wr_en && ~rd_en) count <= count + 1;
-  end
-
-  wire [LOGSIZE-1:0] next_ra = reset ? 0 : rd_en ? ra+1 : ra;
-  always @(posedge clk) begin
-    ra <= next_ra;
-  end
-
-  always @(posedge clk) begin
-    if (reset) wa <= 0;
-    else if (wr_en) wa <= wa + 1;
-  end
-
-  generate
-    if (LOGSIZE <= 6) begin
-      (* ram_style = "distributed" *)
-      reg [WIDTH-1:0] qram[SIZE-1:0];
-      reg [LOGSIZE-1:0] qramAddr;
-      always @(posedge clk) begin
-        qramAddr <= next_ra;
-        if (wr_en) qram[wa] <= din;
-      end
-      assign dout = qram[qramAddr];
-    end
-    else begin
-      (* ram_style = "block" *)
-      reg [WIDTH-1:0] qram[SIZE-1:0];
-      reg [LOGSIZE-1:0] qramAddr;
-      always @(posedge clk) begin
-        qramAddr <= next_ra;
-        if (wr_en) qram[wa] <= din;
-      end
-      assign dout = qram[qramAddr];
-    end
-  endgenerate
-endmodule
-
-`include "core.v"
